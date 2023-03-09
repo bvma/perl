@@ -1,0 +1,726 @@
+#!/usr/bin/perl
+#
+# Wrapper for Avamar VM Backup
+# Matthias Flacke, initial version 2016-02-23
+#
+
+use strict;
+use warnings;
+use FindBin;
+use Data::Dumper;
+use lib "$FindBin::RealBin/../lib";
+use util;
+use Getopt::Long;
+use Pod::Usage qw {pod2usage};
+
+#--- options
+use vars qw(%opt);
+%opt = ();
+&_initopt;
+$opt{"add"}               = 0;
+$opt{"list"}              = 0;
+$opt{"retire"}            = 0;
+$opt{"remove"}            = 0;
+$opt{"status"}            = 0;
+$opt{"hosts"}             = [];
+$opt{"sla"}               = undef;
+$opt{"fqdn"}              = 0;
+$opt{"AVCREATE"} = "create_client.sh";
+$opt{"AVHOST"}            = "voaclivr.dc-ratingen.de";
+$opt{"AVMANAGE"} = "manage_client.sh";
+$opt{"AVPATH"}            = "/opt/avamar/scripts/mccli";
+$opt{"AVREPORTING"}       = "/opt/avamar/scripts/reporting";
+$opt{"AVREPORT"} = "/tmp/avamar_report.csv";
+$opt{"VERSION"}           = "0.1";
+
+my %sla = (
+        "BS"              => "Business Standard",
+        "BP"              => "Business Premium",
+        "MC"              => "Mission Critical",
+        "BA"              => "Basic",
+        "PLATINUM"        => "PLATINUM",
+        "GOLD"            => "GOLD",
+        "SILVER" => "SILVER",
+        "BRONZE" => "BRONZE",
+);
+my %slamap = (
+        "BA"              => "basic",
+        "BS"              => "standard",
+        "BP"              => "tsr",
+        "MC"              => "tsr",
+        "BRONZE" => "basic",
+        "SILVER" => "standard",
+        "GOLD"            => "tsr",
+        "PLATINUM"        => "tsr",
+);
+my %sitemap = (
+        "dubl"            => "dublin",
+        "mila"            => "milan",
+        "rati"            => "ratingen",
+        "voge"            => "ratingen",
+        "voit"            => "milan",
+        "vouk"            => "swindon",
+        "voie"            => "dublin",
+);
+my %abbrev = (
+        "dublin" => "dub",
+        "milan"           => "mil",
+        "ratingen"        => "rat",
+);
+
+
+#--- avamar routines
+sub av_getsites {
+        my %sites = ();
+        my $cluster_ini_format = 'mccli.clusters.([A-Za-z]{4})\S+.ini';
+
+        my @r = run_command("$opt{SSH} $opt{AVHOST} \'(cd $opt{AVPATH}/ini; ls -1 mccli.clusters.*)\'");
+        if ($r[0] != 0) {
+                 _debug 0, "Error:\tgetting mccli.clusters files from $opt{AVHOST}:/$opt{AVPATH}/ini\n" . indent("r[1] $r[2]"                                                                                                        );
+                 return undef;
+        }
+
+        #--- retrieve sites from first 4 characters of cluster INI file names: dubl mila rati voge
+        #---
+        #--- mccli.clusters.Dublin2.ini
+        #--- mccli.clusters.Dublin6.ini
+        #--- mccli.clusters.Dublin.ini
+        #--- mccli.clusters.Milan2.ini
+        #--- mccli.clusters.Milan5.ini
+        #--- mccli.clusters.Milan60.ini
+        #--- mccli.clusters.Milan.ini
+        #--- mccli.clusters.Ratingen2.ini
+        #--- mccli.clusters.Ratingen3.ini
+        #[...]
+        #--- mccli.clusters.vogeave001vx.ini
+        #--- mccli.clusters.vogeave002vx.ini
+        #[...]
+        #
+        foreach my $line (split /\n/, $r[1]) {
+                 if ($line =~ /$cluster_ini_format/) {
+                          my $site = $sitemap{lc($1)} || undef;
+                          if (!defined $site) {
+                                   _debug 1, "Error:\tsite in cluster ini file %s is not coverered by sitemap", $line;
+                          } else {
+                                   $sites{"$site"}++;
+                                   _debug 2, "Info\t:found site ", $site;
+                          }
+                 } else {
+                          _debug 0, "Error\t:invalid cluster INI name in $line, does not match pattern %s",
+                                   $cluster_ini_format;
+                 }
+        }
+        _debug 1, "Info:\tretrieved %d Avamar sites: %s", scalar keys %sites, join(', ', sort keys %sites);
+        foreach my $site (sort keys %sites) {
+                 _debug 1, "\tsite %s with %d grids", $site, $sites{$site};
+        }
+        return \%sites;
+}
+
+sub av_getclusters {
+        my %clusters = ();
+        my $count=0;
+        my @r = run_command("$opt{SSH} $opt{AVHOST} \'(cd $opt{AVPATH}/ini; ls mccli.clusters.*)\'");
+        if ($r[0] != 0) {
+                 _debug 0, "Error:\treading mccli.clusters files from %s", "$opt{AVHOST}:/$opt{AVPATH}/ini";
+                 _debug 0, indent("r[1] $r[2]");
+                 return undef;
+        }
+
+        $opt{sites} = av_getsites if (! defined $opt{sites});
+        foreach my $site (sort keys %{$opt{sites}}) {
+                 #--- get cluster files for site
+                 my $files = join ' ', grep /$site/i, split /\n/, $r[1];
+                 _debug 2, "Info\tfound the following files for $site in $opt{AVPATH}/ini: %s", $files;
+                 my @r = run_command("$opt{SSH} $opt{AVHOST} \'( cd $opt{AVPATH}/ini; cat $files )\'");
+                 if ($r[0] != 0) {
+                          _debug 0, "Error:\treading %s from %s\n%s",
+                                   $files, "$opt{AVHOST}:/$opt{AVPATH}/ini\n", indent("r[1] $r[2]");
+                          return undef;
+                 } else {
+                          foreach my $cluster (split /\n/, $r[1]) {
+                                   $clusters{$site}{$cluster}=1;
+                                   $count++;
+                          }
+                 }
+        }
+        _debug 1, "Info:\tretrieved %d clusters covered by Avamar", $count;
+        return \%clusters;
+}
+sub av_getini {
+        my %vsphere       = ();
+        my $count         = 0;
+        $opt{sites} = av_getsites if (! $opt{sites});
+        foreach my $site (sort keys %{$opt{sites}}) {
+                 my $short = $abbrev{"$site"};
+                 my @r = run_command("$opt{SSH} $opt{AVHOST} \'(cd $opt{AVPATH}/ini; ls mccli.$short.*)\'");
+                 if ($r[0] != 0) {
+                          _debug 0, "Error:\treading mccli.%s.* files from %s", $short, "$opt{AVHOST}:/$opt{AVPATH}/ini";
+                          _debug 0, indent("r[1] $r[2]");
+                          return undef;
+                 }
+                 foreach my $file (split /\n/, $r[1]) {
+                          # mccli.rat.vcde00.tsr.ini
+                          #        |    |     +------ SLA
+                          #        |    +------------ Vsphere
+                          #        +----------------- Site
+                          if ($file=~/mccli\.$short\.([^\.]*)\.([^\.]*)\.ini/) {
+                                   $vsphere{site}{"$1"}=$site;
+                                   $vsphere{vcenter}{"$1"}{"$2"}++;
+                                   $vsphere{sla}{"$2"}{"$1"}++;
+                                   $count++;
+                          } else {
+                                   _debug 1, "Warn:\tfile $file does not match pattern mccli\.$short\.([^\.]*)\.([^\.]*)\.ini                                                                                                        ";
+                          }
+                 }
+        }
+        _debug 1, "Info:\tretrieved %d Avamar ini files", $count;
+        _debug 2, "Info:\tini files content: %s", Dumper \%vsphere;
+        return \%vsphere;
+}
+sub av_getgrid {
+        my $host = shift || return;
+        my $command       = "";
+        my @r             = ();
+
+        #--- new first one: reports
+        #--- grep vobatd04  /opt/avamar/scripts/reporting/t02/reports/report_short_* | tail -1 | awk -F: '{print $2}' | awk '                                                                                                        {print $1}'
+        $command = qq( $opt{SSH} $opt{AVHOST} "grep ${host} /opt/avamar/scripts/reporting/t02/reports/report_short_* | tail -                                                                                                        1 | sed 's/[^:]*://'");
+        @r = run_command($command);
+        if ($r[0] == 0 && $r[1] =~ /^(\S+)/) {
+                 _debug 1, green sprintf "OK:\tfound grid \'%s\' for host \'%s\' in the reports", "$1", $host;
+                 return "$1";
+        } else {
+                 _debug 1, yellow sprintf "Warn:\tcannot find AVAMAR grid for host \'%s\' in the reports", $host;
+        }
+
+        #--- first try in the reference files
+        $command = "$opt{SSH} $opt{AVHOST} \"grep -ir ${host} $opt{AVREPORTING}/t03/lists/AV_reference* | grep '.csv:[^#]'\""                                                                                                        ;
+        @r = run_command($command);
+        if ($r[0] == 0 && $r[1]=~/AV_reference_(.*).csv:.*${host}/sm) {
+                 _debug 1, green sprintf "OK:\tfound grid \'%s\' for host \'%s\'in reference lists", $1, $host;
+                 return "$1";
+        } else {
+                 _debug 1, yellow sprintf "Warn:\tcannot find AVAMAR grid for host \'%s\' in the reference lists", $host;
+        }
+
+        #--- secondly: the /tmp/avamar_report.csv:
+        #Grid,Backup_Type,VM_NAME,Date,Time(CST),Status
+        #grid_host , type , client , start_date , start_time , status
+        #av-un-ie02-adm0 , On-Demand_Backup , uk0177xw , 2020-11-22 , 18:46:00 , Completed
+        #av-un-ie02-adm0 , Scheduled_Backup , aa025exw , 2020-11-21 , 20:04:00 , Completed
+        #av-un-ie02-adm0 , Scheduled_Backup , aa025exw , 2020-11-22 , 20:00:00 , Completed
+        #
+        $command = qq( $opt{SSH} $opt{AVHOST} "grep -i \\", ${host} ,\\"  $opt{AVREPORT} | sort -k 6,6 | tail -1" );
+        @r = run_command($command);
+        if ($r[0] == 0 && $r[1] =~ /^(\S+)/) {
+                 _debug 1, green sprintf "OK:\tfound grid \'%s\' for host \'%s\' in $opt{AVREPORT}", "$1", $host;
+                 return "$1";
+        } else {
+                 _debug 1, yellow sprintf "Warn:\tcannot find AVAMAR grid for host \'%s\' in the $opt{AVREPORT}", $host;
+        }
+
+        #--- third try in the logs
+        $command = "$opt{SSH} $opt{AVHOST} \"/bin/egrep -r \'determined.*as GRID profile for cluster.*${host}\' $opt{AVPATH}/                                                                                                        log\"";
+        @r = run_command($command);
+        if ($r[0] != 0) {
+                 _debug 1, yellow sprintf "Warn:\tcannot find AVAMAR grid for host \'%s\' in the log files %s", $host, indent                                                                                                        ("$r[1] $r[2]");
+                 return "";
+        } elsif ($r[1]=~/.*determined \'([^\']+)\' as GRID profile for cluster .* for \'$host\'/sm) {
+                 _debug 1, green sprintf "OK:\tfound grid \'%s\' for host \'%s\'in the Avamar logs", $1, $host;
+                 return "$1";
+        } else {
+                 _debug 0, yellow sprintf "Warn:\tcannot find AVAMAR grid for host %s in reference and in the logs: %s", $hos                                                                                                        t, indent("$r[1] $r[2]");
+                 _debug 0, "Info:\twill run operation without grid, but that will take some time";
+                 return "";
+        }
+}
+sub read_hosts {
+        my $filename      = shift;
+        my $separator     = shift || '\s+';
+        my @hosts         = ();
+        _fatal 4, "Error:\tfile $filename not found. Exit."
+                 if (! -f $filename);
+        open FILE, "$filename" ||
+                 _fatal 5, "Error:\tcannot open $filename:$!. Exit.";
+        while (<FILE>) {
+                 chomp;
+                 foreach my $token (split(/$separator/)) {
+                          if (is_host($token)) {
+                                   _debug 2, "Info:\ttoken $token is a valid hostname -> added.";
+                                   push @hosts, $token;
+                          } else {
+                                   _debug 0, "Info:\ttoken $token is not a valid hostname -> ignored";
+                          }
+                 }
+        }
+        close FILE  ||
+                 _fatal 6, "Error:\treading $filename:$!. Exit.";
+        _debug 1, "Info:\tretrieved %d hosts from file $filename: %s", $#hosts+1, join(', ', @hosts);
+        return @hosts;
+}
+sub check_opts {
+
+        #--- save original parameters
+        @{$opt{ARGV}} = @ARGV;
+
+        #--- parameters
+        GetOptions(
+                 'a|add'           => \$opt{add},
+                 'c|crq=s'         => \$opt{crq},
+                 'l|list' => \$opt{list},
+                 'remove' => \$opt{remove},
+                 'r|retire'        => \$opt{retire},
+                 's|status'        => \$opt{status},
+                 'e|vcenter=s'     => \$opt{vcenter},
+                 'sla=s'           => \$opt{sla},
+                 'f|filename=s'    => \$opt{filename},
+                 'fqdn'            => \$opt{fqdn},
+                 'h|help:+'        => sub { pod2usage( -verbose => $opt{help} ) },
+                 'v|verbose:+'     => \$opt{verbose},
+                 'version'         => sub { _debug 0, "$opt{MYSELF} version: $opt{version}"; exit 1 },
+        ) or _debug 0, "Error GetOptions\n" . pod2usage(-verbose=>2) && exit 1;
+        _debug 1, "Info:\tcommand line: $opt{MYSELF} " . join(' ', canon @{$opt{ARGV}});
+
+        _debug 2, "Info:\tchecking command line options";
+        env_var("crq","sla","filename");
+        _debug 2, "Info:\tOptions after GetOptions and env_var:" . Dumper(\%opt);
+
+        exit_if_not_groupmember("UNIXADM");
+
+        _fatal 2, "Error:\tno action specified: --add | --retire | --remove | --list\n"
+                 if (! $opt{add} && ! $opt{list} && ! $opt{remove} && ! $opt{retire} && !$opt{status});
+        _fatal 2, "Error:\tmore than one action specified: add:$opt{add} list:$opt{list} retire:$opt{retire} remove:$opt{remo                                                                                                        ve} status:$opt{status}\n"
+                 if ($opt{add} + $opt{list} + $opt{remove} + $opt{retire} + $opt{status} != 1);
+
+        if ($opt{add} || $opt{remove} || $opt{retire}) {
+                 $opt{crq}=check_crq($opt{crq});
+                 $opt{ini}=&av_getini;
+
+                 _fatal 2, "Error:\tno vcenter specified: -e,--vcenter VCENTER\n(where VCENTER should be one of %s)\n", join(                                                                                                        ', ', sort keys %{$opt{ini}{vcenter}})
+                          if (! defined $opt{vcenter});
+                 $opt{vcenter}=lc $opt{vcenter};
+
+
+                 _fatal 2, "Error:\tno sla specified: --sla SLA, where SLA is one of %s", join(', ', sort keys %sla)
+                          if (! defined $opt{sla});
+                 $opt{sla}=uc $opt{sla};
+                 _fatal 2, "Error:\tinvalid sla \'%s\' specified\n\tneed --sla SLA, where SLA is one of %s", $opt{sla}, join(                                                                                                        ', ', sort keys %sla)
+                          if (! defined($sla{$opt{sla}}));
+
+                 if (! defined($opt{ini}{site}{$opt{vcenter}})) {
+                          _fatal 4, "Error:\tVcenter \'$opt{vcenter}\' not known, should be one of:\n\t%s", join("\n\t", sort                                                                                                         keys %{$opt{ini}{vcenter}});
+                 }
+                 $opt{site}=$opt{ini}{site}{$opt{vcenter}};
+                 $opt{shortsite}=$abbrev{$opt{site}};
+                 $opt{avamarsla}=$slamap{$opt{sla}};
+                 _fatal 2, "Error:\tsla %s is not available for vcenter %s, available are only %s", $opt{sla}, $opt{vcenter},                                                                                                         join(', ', sort keys %{$opt{ini}{vcenter}{$opt{vcenter}}})
+                          if (! defined($opt{ini}{vcenter}{$opt{vcenter}}{$slamap{$opt{sla}}}));
+        }
+
+        #--- if filename specified, read file and retrieve hosts from it
+        if ($opt{filename}) {
+                 _debug 2, "Info:\treading hosts from file $opt{filename}";
+                 push @{$opt{hosts}}, read_hosts($opt{filename});
+        }
+        #
+        #--- rest of command line are hosts to add
+        foreach my $token (@ARGV) {
+                 if (is_host($token)) {
+                          _debug 2, "Info:\ttoken $token is a valid hostname -> added.";
+                          push @{$opt{hosts}}, $token;
+                 } else {
+                          _debug 0, "Info:\ttoken $token is not a valid hostname -> ignored.";
+                 }
+        }
+        _fatal 3, "Error:\tno hosts specified\n"
+                 if ($#{$opt{hosts}} < 0);
+
+        _debug 2, "Info:\tOptions 2: %s", Dumper \%opt;
+}
+
+sub av_report {
+        # voaclivr:root:/opt/avamar/scripts/reporting/t02 $ FILES=`ls -1tr /opt/avamar/scripts/reporting/t02/reports/report_s                                                                                                        hort_20[0-9][0-9][0-9][0-9][0-9][0-9] | tail -30`; cat $FILES | grep mftest
+        # Ratingen3 av-un-ge03-adm0 Scheduled_Backup mftest none 9145884240193909 2016-03-24 19:04:00 2016-03-24 19:08:00 198                                                                                                         0 0
+        # Ratingen3 av-un-ge03-adm0 Replication_Source mftest none 1458911907464522 2016-03-25 14:18:00 2016-03-25 14:19:00 6                                                                                                        0 0 0
+        # Ratingen3 av-un-ge03-adm0 Scheduled_Backup mftest none 9145892880186609 2016-03-25 19:00:00 2016-03-25 19:03:00 191                                                                                                         0 0
+        # Ratingen3 av-un-ge03-adm0 Replication_Source mftest none 1458998311391923 2016-03-26 14:18:00 2016-03-26 14:19:00 6                                                                                                        0 0 0
+        # Ratingen3 av-un-ge03-adm0 Scheduled_Backup mftest none 9145901520187809 2016-03-26 19:00:00 2016-03-26 19:09:00 528                                                                                                         0 0
+        # Ratingen3 av-un-ge03-adm0 Scheduled_Backup mftest none 9145909800188509 2016-03-27 19:01:00 2016-03-27 19:04:00 203                                                                                                         0 0
+        # Ratingen3 av-un-ge03-adm0 Replication_Source mftest none 1459081103898211 2016-03-27 14:18:00 2016-03-27 14:19:00 3                                                                                                        0 0 0
+        # Ratingen3 av-un-ge03-adm0 Scheduled_Backup mftest none 9145918440187109 2016-03-28 19:07:00 2016-03-28 19:16:00 546                                                                                                         0 0
+        # Ratingen3 av-un-ge03-adm0 Replication_Source mftest none 1459167516962339 2016-03-28 14:18:00 2016-03-28 14:19:00 6                                                                                                        0 0 0
+        # Ratingen3 av-un-ge03-adm0 Scheduled_Backup mftest none 9145927080193009 2016-03-29 19:14:00 2016-03-29 19:17:00 147                                                                                                         0 0
+        # Ratingen3 av-un-ge03-adm0 Replication_Source mftest none 1459253913344128 2016-03-29 14:18:00 2016-03-29 14:18:00 0                                                                                                         0 0
+        # Ratingen3 av-un-ge03-adm0 Replication_Source mftest none 1459340318205426 2016-03-30 14:19:00 2016-03-30 14:19:00 0                                                                                                         0 0
+        #
+        # Headers
+        # grid  grid_host  type  client  group  backup_id  start_date  start_time  end_date  end_time  duration  return_code                                                                                                          status
+        #
+        my $client        = shift || return;
+        my $lines         = shift || 20;
+        my $separator     = shift || ',';
+        my @headers       = (      "grid", "grid_host", "type", "client", "group", "backup_id", "start_date",
+                                   "start_time", "end_date", "end_time", "duration", "return_code", "status" );
+        #my $reportdir    = "/opt/avamar/scripts/reporting/t0[23]/reports";
+        #my $reportpat    = "report_short_20[0-9][0-9][0-9][0-9][0-9][0-9]";
+        #--- MF 2020-12-11: take backups directly from raw reports
+        my $reportdir     = "/opt/avamar/scripts/reporting/t02/raw";
+        my $reportpat     = "backups_20[0-9][0-9][0-9][0-9][0-9][0-9]";
+        my $reportlines = 0;
+
+        my @r = run_command("$opt{SSH} $opt{AVHOST} \'FILES=`ls -1tr $reportdir/$reportpat \| tail -$lines`; cat \$FILES \| g                                                                                                        rep -i $client\'");
+        #my @r = run_command("$opt{SSH} $opt{AVHOST} \'FILES=`find $reportdir -mtime 10`; cat \$FILES \| egrep \"Avamar.*$cli                                                                                                        ent.*full|Avamar.*$client.*incr\"\'");
+        if ($r[0] != 0) {
+                 _debug 0, "Error:\tno report data for \'$client\' in $opt{AVHOST}:$reportdir/$reportpat\n" . indent("$r[1] $                                                                                                        r[2]");
+                 return undef;
+        } else {
+                 $r[1] =~ s# #$separator#g;
+                 $reportlines = $r[1] =~ tr/\n//;
+                 _debug 0, join $separator, @headers;
+                 _debug 0, $r[1];
+                 _debug 1, "Info\treport lines: $reportlines";
+
+                 #--- save csv in build share for reporting, if CRQ is available
+                 if (defined $opt{crq}) {
+                          $opt{crq} = check_crq($opt{crq});
+                          my $outputdir     = "/build/share/output/$opt{crq}";
+                          my $csvfile       = sprintf "avamar_report_%s_%s.csv", $client, &today;
+                          my $content       = sprintf "%s\n%s\n", join($separator, @headers), $r[1];
+                          write_array_to_file("$outputdir/$csvfile", $content);
+                          _debug 0, "Info:\tWritten report for $client to http://build.dc-ratingen.de/output/$opt{crq}/$csvfi                                                                                                        le";
+                 }
+        }
+        return $reportlines;
+}
+
+sub av_status {
+        my $client        = shift || return;
+        my @r             = ();
+        my $vcenter       = undef;
+
+        #--- 1. get grid for client
+        my $grid = av_getgrid($client);
+        if (! $grid) {
+                 _debug 0, red sprintf "Error:\tno grid found for client $client, no status available";
+                 return;
+        }
+
+        #--- 2. find vcenter FQDN for client
+        #---
+        #--- voaclivr:root:/opt/avamar/QA_tools $  mccli client show --recursive=true --mcsprofile=vogeave401vx | grep vg6600                                                                                                        yr
+        #--- vg6600yr       /cidevcssrv12.admnet.vodafone.com/VirtualMachines/DECI11RHEL02/BA  Virtual Machine
+
+        @r = run_command("$opt{SSH} $opt{AVHOST} /usr/bin/mccli client show --recursive=true --mcsprofile=$grid");
+        if ($r[0] != 0) {
+                 _debug 0, red sprintf "Error:\tfailed to get MCCLI info for client $client";
+                 _debug 0, indent("$r[1] $r[2]");
+                 return;
+        } else {
+                 my $clientline    = ( grep /$client/i, split("\n", $r[1]) )[0];
+                 _debug 1, "OK:\tclient info: $clientline";
+                 $vcenter = (split("/", $clientline))[1];
+                 _debug 1, "OK:\tvcenter of client $client: $vcenter";
+        }
+
+        #--- 3. get Avamar info for client in Vcenter
+        #---
+        # voaclivr:root:/opt/avamar/QA_tools $ /opt/avamar/scripts/mccli/get_client_status.sh -v cidevcssrv12.admnet.vodafone                                                                                                        .com -c vg6600yr
+        # --- 2020-12-11-15:06:13 --- START of get_client_status
+        # --- 2020-12-11-15:06:13 --- logfile is /opt/avamar/scripts/mccli/log/2020-12-11-15:06:13.verifyCI_client.log
+        # --- 2020-12-11-15:06:13 --- parameter are: >>>  -v cidevcssrv12.admnet.vodafone.com -c vg6600yr  <<<
+        # --- 2020-12-11-15:06:13 --- Check client entry in Reference file '/opt/avamar/scripts/reporting/t03/lists/AV_refere                                                                                                        nce_*'
+        # --- 2020-12-11-15:06:13 --- client '-v' not found in Reference
+        # --- 2020-12-11-15:06:13 --- client not found
+        # --- 2020-12-11-15:06:13 --- Search recursively on grid 'vogeave200vx' in domain '/cidevcssrv12.admnet.vodafone.com'                                                                                                        .
+        # --- 2020-12-11-15:06:19 --- client not found
+        # --- 2020-12-11-15:06:19 --- Search recursively on grid 'vogeave201vx' in domain '/cidevcssrv12.admnet.vodafone.com'                                                                                                        .
+        # ^Cvoaclivr:root:/opt/avamar/QA_tools $ /opt/avamar/scripts/mccli/get_client_status.sh
+        # Parameter missing: use ./get_client_status.sh <vm> <vcenter fqdn>
+        # voaclivr:root:/opt/avamar/QA_tools $ /opt/avamar/scripts/mccli/get_client_status.sh vg6600yr cidevcssrv12.admnet.vo                                                                                                        dafone.com
+        # --- 2020-12-11-15:06:37 --- START of get_client_status
+        # --- 2020-12-11-15:06:37 --- logfile is /opt/avamar/scripts/mccli/log/2020-12-11-15:06:37.verifyCI_client.log
+        # --- 2020-12-11-15:06:37 --- parameter are: >>>  vg6600yr cidevcssrv12.admnet.vodafone.com  <<<
+        # --- 2020-12-11-15:06:37 --- Check client entry in Reference file '/opt/avamar/scripts/reporting/t03/lists/AV_refere                                                                                                        nce_*'
+        # --- 2020-12-11-15:06:37 --- found Avamar Grid Hostname 'vogeave401vx'
+        # --- 2020-12-11-15:06:37 --- translated Avamar Grid Hostname 'vogeave401vx' to Avamar Profile 'vogeave401vx'
+        # --- 2020-12-11-15:06:37 --- client found in Reference file --> sla 'BA'
+        # --- 2020-12-11-15:06:37 --- client found in Reference file --> cluster 'DECI11RHEL02'
+        # --- 2020-12-11-15:06:37 --- search for client '/cidevcssrv12.admnet.vodafone.com/VirtualMachines/DECI11RHEL02/BA/vg                                                                                                        6600yr' on Avamar 'vogeave401vx'
+        # --- 2020-12-11-15:06:40 --- client found
+        # --- 2020-12-11-15:06:40 --- 0,23000,CLI command completed successfully.
+        # Attribute                Value
+        # ------------------------ ------------------------------------------------------------------------------------------                                                                                                        --------
+        # Client Name              vg6600yr
+        # Fully Qualified Name     /cidevcssrv12.admnet.vodafone.com/VirtualMachines/DECI11RHEL02/BA/vg6600yr_SyfzgnVmN8KyPbx                                                                                                        HKQeaTg
+        # Client Type              Virtual Machine
+        # Operating System         rhel7_64Guest
+        # Paging                   Yes
+        # CID                      a948702ba40ee03af3a8246d7b098ea2dbd10e1d
+        # CID Assigned             2020-10-16 13:32:13 CEST
+        # Disabled                 No
+        # Agent Last Started       2020-12-11 06:20:47 CET
+        # Override Group Retention No
+        # Retention Policy         32DAYS
+        # Overtime Option          No overtime allowed
+        # Restore Only             No
+        # Avamar encryption method High
+        # Override Encryption      No
+        # Allow CIS                Yes
+        # Allow CIS file selection Yes
+        # Override CIS retention   No
+        # Browse Timeout           10 seconds
+        # Contact Name             N/A
+        # Contact Phone            N/A
+        # Contact Email            N/A
+        # Contact Location         N/A
+        # Contact Notes            N/A
+        # Member of Group          /cidevcssrv12.admnet.vodafone.com/VirtualMachines/DECI11RHEL02/BA/SYS_0032_GE27_BA_DECI11R                                                                                                        HEL02_07
+        # Plugin                   Linux VMware Image(1016)
+        # Initial Install Date     2020-10-16 13:32:13 CEST
+        # Last Version Registered  2020-10-16 13:32:13 CEST
+        # Last Successful Backup   N/A
+        # --- 2020-12-11-15:06:40 --- client 'vg6600yr' found on grid 'vogeave401vx'
+        # --- 2020-12-11-15:06:40 --- End get_client_status with exit 0
+
+        @r = run_command("$opt{SSH} $opt{AVHOST} /opt/avamar/scripts/mccli/get_client_status.sh $client $vcenter");
+        if ($r[0] != 0) {
+                 _debug 0, red sprintf "Error:\tfailed to get Avamar client status for $client";
+                 _debug 0, indent("$r[1] $r[2]");
+                 return;
+        } else {
+                 my @output = grep { ! /^---/ } split("\n", $r[1]);
+                 _debug 0, "Info:\tAvamar client status for $client:\n%s", indent join("\n", @output);
+        }
+}
+
+sub av_logfile {
+        my $message       = shift || return;
+        my $logdir        = shift || "/opt/avamar/scripts/mccli/log";
+        my $logfile       = undef;
+
+        if ($message =~ /messages were written to logfile (.*.client.log)/){
+                 $logfile = $1;
+        } else {
+                 _debug 0, "cannot retrieve logfile from output \'$message\'";
+                 return undef;
+        }
+
+        _debug 0, "$opt{SSH} $opt{AVHOST} /bin/cat ${logdir}/${logfile}";
+
+        my @r = run_command("$opt{SSH} $opt{AVHOST} /bin/cat ${logdir}/${logfile}");
+        if ($r[0] != 0) {
+                 _debug 0, "Error:\treading logfile $logfile failed:";
+                 _debug 0, indent("$r[1] $r[2]");
+                 return "";
+        } else {
+                 return $r[1];
+        }
+}
+
+#--- main
+&check_opts;
+
+&header_line(0, "%s: %s %d hosts",
+        $opt{MYSELF},
+        ($opt{add})       ? "adding"
+                          : ($opt{remove})
+                                   ? "removing"
+                                   : "listing",
+        $#{$opt{hosts}}+1
+);
+
+#--- loop over hosts
+my $command = "";
+$opt{result}{error}=0;
+$opt{result}{ok}=0;
+$opt{result}{rc}=0;
+foreach my $host (@{$opt{hosts}}) {
+        #
+        #--- ensure that we have a shortname (default) if not --fqdn
+        $host=short_name($host) if (! $opt{fqdn});
+
+        if ($opt{add}) {
+                 _debug 0, "Info:\tadding host \'$host\'";
+                 $command = "$opt{SSH} $opt{AVHOST} \'$opt{AVPATH}/$opt{AVCREATE} mccli.$opt{shortsite}.$opt{vcenter}.$opt{av                                                                                                        amarsla}.ini $host\'";
+                 _debug 1, "Info:\trunning add command: $command";
+                 my @r = run_command("$command");
+                 if ($r[0] != 0) {
+                          _debug 0, "Error:\tadding host \'$host\' failed";
+                          #_debug 0, indent("\tcommand \'$command\':");
+                          #_debug 0, indent("$r[1] $r[2]");
+                          _debug 0, av_logfile($r[1]);
+                          $opt{result}{rc} |= 11;
+                          $opt{result}{error}++;
+                          next;
+                 } else {
+                          _debug 0, green sprintf "OK:\tsuccessfully added \'$host\' to AVAMAR (mccli.$opt{shortsite}.$opt{vc                                                                                                        enter}.$opt{avamarsla}.ini)";
+                          $opt{result}{ok}++;
+                 }
+                 #_debug 0, "Call would be \'$opt{AVPATH}/$opt{AVCREATE} mccli.$opt{shortsite}.$opt{vcenter}.$opt{avamarsla}.                                                                                                        ini $host\'";
+        } elsif ($opt{list}) {
+                 if (! av_report($host)) {
+                          $opt{result}{errors}++;
+                          $opt{result}{rc}|=13;
+                 }
+        } elsif ($opt{remove}) {
+                 _debug 0, "Info:\tremoving host \'$host\'";
+                 my $grid = av_getgrid($host);
+                 _debug 1, "OK:\tfound grid \'$grid\' for host \'$host\' in logs";
+
+                 $command = "$opt{SSH} $opt{AVHOST} \"$opt{AVPATH}/$opt{AVMANAGE} $grid delete \'deleted by $main::opt{WHOAMI                                                                                                        } with $opt{MYSELF}\' $host\"";
+                 _debug 1, "Info:\trunning delete command: $command";
+                 my @r = run_command("$command");
+                 if ($r[0] != 0) {
+                          _debug 0, red sprintf "Error:\tremoving host \'$host\' failed";
+                          #_debug 0, indent("command \'$command\' failed:");
+                          #_debug 0, indent("$r[1] $r[2]");
+                          _debug 0, av_logfile($r[1]);
+                          $opt{result}{rc} |= 12;
+                          $opt{result}{error}++;
+                          next;
+                 } else {
+                          _debug 0, green sprintf "OK:\tsuccessfully removed \'$host\' from AVAMAR grid \'$grid\'";
+                          $opt{result}{ok}++;
+                 }
+        } elsif ($opt{retire}) {
+                 _debug 0, "Info:\tretiring host \'$host\'";
+                 my $grid = av_getgrid($host);
+
+                 $command = "$opt{SSH} $opt{AVHOST} \'$opt{AVPATH}/$opt{AVMANAGE} $grid retire \"retired by $main::opt{WHOAMI                                                                                                        } with $opt{MYSELF}\" $host\'";
+                 _debug 1, "Info:\trunning retire command: $command";
+                 my @r = run_command("$command");
+                 if ($r[0] != 0) {
+                          _debug 0, red sprintf "Error:\tretiring host \'$host\' failed";
+                          #_debug 0, indent("command \'$command\' failed:");
+                          #_debug 0, indent("$r[1] $r[2]");
+                          _debug 0, av_logfile($r[1]);
+                          $opt{result}{rc} |= 12;
+                          $opt{result}{error}++;
+                          next;
+                 } else {
+                          _debug 0, green sprintf "OK:\tsuccessfully retired \'$host\' from AVAMAR grid \'$grid\'";
+                          $opt{result}{ok}++;
+                 }
+        #--- TODO: retrieve _current_ client status @AVAMAR
+        } elsif ($opt{status}) {
+                 _debug 0, sprintf "Info:\tretrieving status for client $host, will usually take 15s";
+                 if (! av_status($host)) {
+                          $opt{result}{errors}++;
+                          $opt{result}{rc}|=13;
+                 }
+        } else {
+                 _fatal 99, "Error:\timplementation error, should not reach this point... :-)";
+        }
+}
+#--- print results and exit with RC
+header_line( 0, "%s summary: %d actions - OK:%d - Error:%d - RC:%d",
+        $opt{MYSELF}, $#{$opt{hosts}}+1, $opt{result}{ok}, $opt{result}{error}, $opt{result}{rc} );
+exit $opt{result}{rc};
+
+__END__
+
+=pod
+
+=head1 USAGE
+
+vf_avamar.pl -a|-r|-l -e VCENTER -l SLA [-f HOSTFILE] HOST1 [HOST2 ...]
+
+=head2 ACTIONS
+
+=over
+
+=item B<-a, --add>
+
+add host to Avamar backup
+
+=item B<-r, --retire>
+
+retire host from Avamar backup
+
+If a host was already backed up, please use this option. It will properly remove the host from the Avamar booking.
+
+Old backups are kept, until they are removed controlled by retention.
+
+=item B<--remove>
+
+remove host from Avamar backup
+
+Please use this option only if a host has not been in backup for long and it has to be removed due to a typo, or testing or s                                                                                                        uch.
+
+=item B<-l, --list>
+
+show last Avamar reports for host
+
+If you specify a CRQ, a CSV report file will be written to /build/share/output/CRQ/avamar_report_CLIENT_DATE.csv
+
+=back
+
+=head2 OPTIONS
+
+=over
+
+=item B<-c, --crq>
+
+specify CRQ/INC (beginning with CRQ or INC, followed by 8-12 digits
+
+=item B<-e, --vcenter>
+
+specify vcenter where host is residing
+
+=item B<--sla>
+
+specify SLA, one of BA (basic), BS (standard), BP (tsr), MC (tsr)
+
+=item B<-f, --filename HOSTFILE>
+
+specify hosts filename, format should be a list of hosts.
+
+All hostnames are taken, IP addresses are ignored. Therefore you can
+use a standard hosts file.
+
+FQDNs are transformed into short host names.
+
+=item B<--fqdn>
+
+In seldom cases it's required to add FQDNs instead of short host names.
+This option overrides the default and let you add FQDNs.
+
+=item B<-v, --verbose>
+
+set verbosity (default:0)
+Multiple -v add more verbosity!
+
+=item B<--version>
+
+show version number.
+
+=item B<-h, --help>
+
+shows this help.
+
+=back
+
+=head2 RETURN CODES
+
+=over
+
+=item 1 GetOpt error
+
+=item 2 Logical option error
+
+=item 3 Host specification error
+
+=item 4 Hosts file error
+
+=item 11 Error adding host to Avamar
+
+=item 12 Error removing host from Avamar
+
+=back
+
+=cut
+
+=head2 AUTHOR
+
+Matthias Flacke (questions, complains, patches, enhancement requests, kudos to matthias.flacke@vodafone.com)
